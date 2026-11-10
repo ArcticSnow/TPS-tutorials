@@ -1,0 +1,72 @@
+project:
+    name: Izas_points
+    description: TopoPyScale demo - ERA5 (6-hourly) downscaled to the Izas AWS and two aspect "twins"
+    authors:
+        - Mazzolini M.
+    date: Nov 2026
+    directory: $project_dir
+    start: 2019-01-01
+    end: 2020-12-31
+    split:
+        IO: False
+        time: 1
+        space: None
+    extent:
+    climate: era5
+    parallelization:
+        downscaling_method: multicore
+        setting:
+            multicore:
+                CPU_cores: $cpu_cores
+            dask:
+                n_workers: $cpu_cores
+                threads_per_worker: 1
+                memory_target_fraction: 0.95
+                memory_limit: 4GB
+
+climate:
+    era5:
+        path: inputs/climate/
+        product: reanalysis
+        timestep: 6h
+        plevels: [600, 650, 700, 750, 800, 850, 900, 950, 1000]
+        download_threads: 1
+        realtime: False
+        data_repository: cds
+        cds_output_format: netcdf
+        cds_download_format: unarchived
+        rm_daily: False
+        zarr_store: ERA5.zarr   # ERA5 converted to zarr: much faster downscaling than reading the NetCDF files
+    precip_lapse_rate: True
+
+dem:
+    file: $dem_file
+    epsg: 32630
+    horizon_increments: 10
+
+sampling:
+    method: points
+    points:
+        csv_file: izas_points.csv     # columns name, x, y (EPSG:32630), in inputs/dem/
+        name_column: name
+
+toposcale:
+    interpolation_method: idw
+    pt_sampling_method: nearest
+    LW_terrain_contribution: True
+
+outputs:
+    directory:
+    variables: all
+    file:
+        clean_outputs: False
+        clean_FSM: False
+        df_centroids: df_centroids.pck
+        ds_param: ds_param.nc
+        ds_solar: ds_solar.nc
+        da_horizon: da_horizon.nc
+        landform: landform.tif
+        downscaled_pt: down_pt_*.nc
+
+clean_up:
+    rm_tmp_dirs: True

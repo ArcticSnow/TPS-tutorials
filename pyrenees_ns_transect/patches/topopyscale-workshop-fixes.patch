@@ -1,0 +1,407 @@
+diff --git a/TopoPyScale/fetch_era5.py b/TopoPyScale/fetch_era5.py
+index 06664ed..821c814 100644
+--- a/TopoPyScale/fetch_era5.py
++++ b/TopoPyScale/fetch_era5.py
+@@ -113,7 +113,7 @@ class FetchERA5():
+     def load_config(config_file):
+         try:
+             with open(config_file, 'r') as f:
+-                return DefaultMunch.fromYAML(f)
++                return DefaultMunch.fromYAML(f, None)  # missing keys -> None (munch>=4 otherwise returns {})
+         except IOError:
+             print(f'ERROR: config file does not exist. \n\t Current file path: {config_file}\n\t Current working directory: {os.getcwd()}')
+ 
+@@ -932,10 +932,12 @@ def unzip_file(file_path):
+             merged_file_path = os.path.join(os.path.dirname(zip_file_path), os.path.basename(zip_file_path).replace('.zip', '.nc'))
+             try:
+                 # Combine all `.nc` files
+-                merged_ds = xr.open_mfdataset(str(Path(unzip_dir) / "*.nc"))
+-                #datasets = [xr.open_dataset(nc_file, engine='netcdf4') for nc_file in nc_files]
+-                #merged_ds = xr.merge(datasets, compat='override')  # Use override to handle conflicting metadata like 'expver'
+-                merged_ds.to_netcdf(merged_file_path)
++                # close the source files before deleting them (on NFS, deleting open files leaves .nfs* files
++                # and the clean-up below fails with "Directory not empty")
++                with xr.open_mfdataset(str(Path(unzip_dir) / "*.nc")) as merged_ds:
++                    #datasets = [xr.open_dataset(nc_file, engine='netcdf4') for nc_file in nc_files]
++                    #merged_ds = xr.merge(datasets, compat='override')  # Use override to handle conflicting metadata like 'expver'
++                    merged_ds.to_netcdf(merged_file_path)
+                 print(f"Merged .nc files into {merged_file_path}.")
+             except:
+                 raise IOError("Unzipping failing.")
+diff --git a/TopoPyScale/sim_fsm.py b/TopoPyScale/sim_fsm.py
+index d73321a..b523587 100644
+--- a/TopoPyScale/sim_fsm.py
++++ b/TopoPyScale/sim_fsm.py
+@@ -24,7 +24,30 @@ import datetime as dt
+ from TopoPyScale import topo_utils as tu
+ from TopoPyScale import topo_export as te
+ 
+-def fsm_nlst(nconfig, metfile, nave):
++def infer_met_timestep(metfile, default=3600):
++    """
++    Infer the timestep (in seconds) of an FSM forcing file from its first two rows (year month day hour ...).
++
++    Args:
++        metfile (str): path to FSM forcing file
++        default (float): value returned (with a warning) if the timestep cannot be inferred
++
++    Returns:
++        float: timestep in seconds
++    """
++    try:
++        head = pd.read_csv(metfile, sep=r'\s+', header=None, nrows=2, usecols=[0, 1, 2, 3])
++        times = pd.to_datetime(dict(year=head[0], month=head[1], day=head[2], hour=head[3]))
++        tstep = (times.iloc[1] - times.iloc[0]).total_seconds()
++        if tstep <= 0:
++            raise ValueError
++        return float(tstep)
++    except Exception:
++        print(f'WARNING: cannot infer timestep from {metfile}, assuming {default} s')
++        return float(default)
++
++
++def fsm_nlst(nconfig, metfile, nave, dt_seconds=3600):
+     """
+     Function to generate namelist parameter file that is required to run the FSM model.
+     https://github.com/RichardEssery/FSM
+@@ -32,8 +55,10 @@ def fsm_nlst(nconfig, metfile, nave):
+     Args:
+         nconfig (int): which FSm configuration to run (integer 1-31)
+         metfile (str): path to input tscale file (relative as Fortran fails with long strings (max 21 chars?))
+-        nave (int): number of forcing steps to average output over eg if forcing is hourly and output required is daily then nave = 24
+-    
++        nave (int): number of forcing steps to average output over eg if forcing is hourly and output required is daily then nave = 24.
++            If forcing is 6-hourly and output required is daily then nave = 4
++        dt_seconds (int): timestep of the forcing file in seconds (FSM namelist 'dt'). Default = 3600 (hourly)
++
+     Returns:
+         NULL (writes out namelist text file which configures a single FSM run)
+ 
+@@ -62,8 +87,8 @@ def fsm_nlst(nconfig, metfile, nave):
+     """
+ 
+     METEOFILENAME = os.path.split(metfile)[1].split('.txt')[0]
+-    if not os.path.exists('./fsm_sims'):
+-        os.mkdir('./fsm_sims')
++    # exist_ok: fsm_nlst runs in a thread pool (fsm_sim_parallel), several threads may create the folder at once
++    os.makedirs('./fsm_sims', exist_ok=True)
+ 
+     f = open('./fsm_sims/nlst_' + METEOFILENAME + '.txt', 'w')
+     f.write('&config' + '\n')
+@@ -71,6 +96,7 @@ def fsm_nlst(nconfig, metfile, nave):
+     f.write('/' + '\n')
+     f.write('&drive' + '\n')
+     f.write('  met_file = ' + "'" + metfile + "'" + '\n')
++    f.write('  dt = ' + str(int(dt_seconds)) + '\n')
+     f.write('  zT = 1.5' + '\n')
+     f.write('  zvar = .FALSE.' + '\n')
+     f.write('/' + '\n')
+@@ -222,12 +248,11 @@ def read_pt_fsm(fname):
+     Returns:
+         pandas dataframe
+     '''
+-    fsm = pd.read_csv(fname,
+-                delim_whitespace=True,
+-                header=0,
+-                index_col='time',
+-                parse_dates = {'time': [0, 1, 2, 3]},
+-                date_format = '%Y %m %d %H.000')
++    # FSM output files have no header line: year month day hour(float) + 6 variables
++    fsm = pd.read_csv(fname, sep=r'\s+', header=None)
++    fsm.index = pd.DatetimeIndex(pd.to_datetime(dict(year=fsm[0], month=fsm[1], day=fsm[2],
++                                                     hour=fsm[3].astype(float).round().astype(int))), name='time')
++    fsm = fsm.iloc[:, 4:10]
+     fsm.columns = ['albedo', 'runoff', 'snd', 'swe', 't_surface', 't_soil']
+     return fsm
+ 
+@@ -250,7 +275,8 @@ def fsm_sim_parallel(fsm_input='outputs/FSM_pt*.txt',
+                      fsm_exec='./FSM',
+                      n_core=6,
+                      n_thread=100,
+-                     delete_nlst_files=True):
++                     delete_nlst_files=True,
++                     fsm_dt=None):
+     '''
+     Function to run parallelised simulations of FSM
+ 
+@@ -258,6 +284,8 @@ def fsm_sim_parallel(fsm_input='outputs/FSM_pt*.txt',
+         fsm_input (str or list): file pattern or list of file input to FSM. Note that must be in short relative path!. Default = 'outputs/FSM_pt*.txt'
+         fsm_nconfig (int):  FSM configuration number. See FSM README.md: https://github.com/RichardEssery/FSM. Default = 31
+         fsm_nave (int): number of timestep to average for outputs. e.g. If input is hourly and fsm_nave=24, outputs will be daily. Default = 24
++            (with 6-hourly forcing, use fsm_nave=4 for daily outputs)
++        fsm_dt (int): forcing timestep in seconds (FSM namelist 'dt'). If None (default), it is inferred from the first forcing file
+         fsm_exec (str): path to FSM executable. Default = './FSM'
+         n_core (int): number of cores. Default = 6
+         n_thread (int): number of threads when creating simulation configuration files. Default=100
+@@ -269,14 +297,21 @@ def fsm_sim_parallel(fsm_input='outputs/FSM_pt*.txt',
+     print('---> Run FSM simulation in parallel')
+     # 1. create all nlsit_files
+     if isinstance(fsm_input, str):
+-        met_flist = glob.glob(fsm_input)
++        met_flist = sorted(glob.glob(fsm_input))
+     elif isinstance(fsm_input, list):
+-        met_list = fsm_input
++        met_flist = fsm_input
+     else:
+         print('ERROR: fsm_input must either be a list of file path or a string of file pattern')
+         return
++    if len(met_flist) == 0:
++        print(f'ERROR: no FSM forcing file found for {fsm_input}')
++        return
++
++    if fsm_dt is None:
++        fsm_dt = infer_met_timestep(met_flist[0])
++    print(f'---> FSM timestep: {fsm_dt:.0f} s, output averaged over {fsm_nave} timesteps')
+ 
+-    fun_param = zip([fsm_nconfig]*len(met_flist), met_flist, [fsm_nave]*len(met_flist) )
++    fun_param = zip([fsm_nconfig]*len(met_flist), met_flist, [fsm_nave]*len(met_flist), [fsm_dt]*len(met_flist))
+     tu.multithread_pooling(fsm_nlst, fun_param, n_thread)
+     print('nlst files ready')
+ 
+diff --git a/TopoPyScale/topo_export.py b/TopoPyScale/topo_export.py
+index 24ac1c2..650b554 100644
+--- a/TopoPyScale/topo_export.py
++++ b/TopoPyScale/topo_export.py
+@@ -1106,7 +1106,27 @@ def to_fsm2oshd(mp,
+     return
+ 
+ 
+-def to_fsm(ds, fname_format='FSM_pt_*.tx', snow_partition_method='continuous', n_digits=None):
++def _infer_tstep_seconds(ds, default=3600):
++    """
++    Infer the timestep (in seconds) of a dataset from its time coordinate.
++
++    The median of the time differences is used so that occasional gaps do not bias the estimate.
++
++    Args:
++        ds (dataset): dataset with a 'time' coordinate
++        default (float): value returned (with a warning) if the timestep cannot be inferred
++
++    Returns:
++        float: timestep in seconds
++    """
++    times = pd.to_datetime(np.atleast_1d(ds.time.values))
++    if times.size < 2:
++        print(f'WARNING: cannot infer timestep from a single timestamp, assuming {default} s')
++        return float(default)
++    return float(pd.Series(times).diff().dropna().median().total_seconds())
++
++
++def to_fsm(ds, fname_format='FSM_pt_*.tx', snow_partition_method='continuous', n_digits=None, tstep_seconds=None):
+     """
+     Function to export data for FSM.
+ 
+@@ -1115,6 +1135,11 @@ def to_fsm(ds, fname_format='FSM_pt_*.tx', snow_partition_method='continuous', n
+         df_pts (dataframe): toposub.df_centroids,
+         fname_format (str pattern): output format of filename
+         snow_partition_method (str): snow/rain partitioning method: default 'jennings2018_trivariate'
++        n_digits (int): number of digits used to zero-pad the point index in file names
++        tstep_seconds (float): timestep of ds in seconds. If None (default), it is inferred from ds.time.
++            Downscaled precipitation 'tp' is in mm per timestep, so it is divided by the timestep
++            to obtain a rate in kg/m2/s. Use the same timestep as 'dt' in the FSM namelist
++            (see sim_fsm.fsm_nlst).
+ 
+     format is a text file with the following columns
+     year month  day   hour  SW      LW      Sf         Rf     Ta  RH   Ua    Ps
+@@ -1122,13 +1147,16 @@ def to_fsm(ds, fname_format='FSM_pt_*.tx', snow_partition_method='continuous', n
+ 
+     See README.md file from FSM source code for further details
+ 
+-    TODO: 
++    TODO:
+     - Check unit DONE jf
+     - Check format is compatible with compiled model DONE jf
+     - ensure ds.point_name.values always
+     """
+     if n_digits is None:
+         n_digits = len(str(len(ds.point_name)))
++    if tstep_seconds is None:
++        tstep_seconds = _infer_tstep_seconds(ds)
++    print(f'---> FSM export with a timestep of {tstep_seconds:.0f} s')
+ 
+     for pt_ind, pt_name in enumerate(ds.point_name.values):
+         foutput = str(fname_format).split('*')[0] + str(pt_ind).zfill(n_digits) + str(fname_format).split('*')[1]
+@@ -1143,8 +1171,9 @@ def to_fsm(ds, fname_format='FSM_pt_*.tx', snow_partition_method='continuous', n
+         rh = mu.q_2_rh(ds_pt.t.values, ds_pt.p.values, ds_pt.q.values)
+         rain, snow = mu.partition_snow(ds_pt.tp.values, ds_pt.t.values, rh, ds_pt.p.values,
+                                        method=snow_partition_method)
+-        df['snowfall'] = snow / 3600
+-        df['rainfall'] = rain / 3600
++        # tp is in mm per timestep -> kg m-2 s-1
++        df['snowfall'] = snow / tstep_seconds
++        df['rainfall'] = rain / tstep_seconds
+         df['Tair'] = np.round(ds_pt.t.values, 2)
+         df['RH'] = rh * 100
+         df['speed'] = ds_pt.ws.values
+diff --git a/TopoPyScale/topo_scale_zarr.py b/TopoPyScale/topo_scale_zarr.py
+index c21bd2b..c9a736b 100644
+--- a/TopoPyScale/topo_scale_zarr.py
++++ b/TopoPyScale/topo_scale_zarr.py
+@@ -39,6 +39,11 @@ import dask.array as da
+ import pdb
+ import time
+ 
++# Surface variables in the combined (PLEV + SURF) zarr dataset: the 2 m specific humidity and mixing ratio get
++# their own names, otherwise mu.dewT_2_q_magnus() overwrites the pressure-level specific humidity 'q'
++# (used for the vertical interpolation) with the surface value.
++var_era_surf_zarr = dict(mu.var_era_surf, spec_h='q_surf', mix_ratio='w_surf')
++
+ 
+ varout_default = ['t',
+          'u',
+@@ -233,7 +238,7 @@ class ClimateDownscaler:
+                                  keep_attrs=True)  # compute horizontal inverse weighted horizontal interpolation
+ 
+         # ============ Extract specific humidity (q) for both dataset ============
+-        subset_interp = mu.dewT_2_q_magnus(subset_interp, mu.var_era_surf)
++        subset_interp = mu.dewT_2_q_magnus(subset_interp, var_era_surf_zarr)
+ 
+ 
+         #subset_interp['rh'] = mu.q_2_rh(subset_interp.t, subset_interp.tp, subset_interp.q)
+@@ -305,7 +310,9 @@ class ClimateDownscaler:
+             down_pt['precip_lapse_rate'] = down_pt.t * 0 + 1
+         
+         print(f"Downscaling SW, LW for point: {pt_id}")
+-        down_pt['tp'] = down_pt.precip_lapse_rate * subset_interp.tp * 1 / meta.get('tstep') * 10 ** 3  # Convert to mm/hr
++        # ERA5 tp is the 1-hour accumulation ending at the time stamp: scale it to mm per time step
++        # (same convention as topo_scale.py; for 1h data this is mm/hr)
++        down_pt['tp'] = down_pt.precip_lapse_rate * subset_interp.tp * 1 * meta.get('tstep') * 10 ** 3
+         down_pt['theta'] = np.arctan2(-down_pt.u, -down_pt.v)
+         down_pt['theta_neg'] = (down_pt.theta < 0) * (down_pt.theta + 2 * np.pi)
+         down_pt['theta_pos'] = (down_pt.theta >= 0) * down_pt.theta
+@@ -324,15 +331,17 @@ class ClimateDownscaler:
+ 
+         down_pt = mu.mixing_ratio(down_pt, mu.var_era_plevel)
+         down_pt = mu.vapor_pressure(down_pt, mu.var_era_plevel)
+-        subset_interp = mu.mixing_ratio(subset_interp, mu.var_era_surf)
+-        subset_interp = mu.vapor_pressure(subset_interp, mu.var_era_surf)
++        subset_interp = mu.mixing_ratio(subset_interp, var_era_surf_zarr)
++        subset_interp = mu.vapor_pressure(subset_interp, var_era_surf_zarr)
+ 
+         # ========= Compute clear sky emissivity ===============
+         down_pt['cse'] = 0.23 + x1 * (down_pt.vp / down_pt.t) ** (1 / x2)
+         subset_interp['cse'] = 0.23 + x1 * (subset_interp.vp / subset_interp.t2m) ** (1 / x2)
+         # Calculate the "cloud" emissivity, UNIT OF STRD (Jjoel_testJun2023/m2)
+ 
+-        tstep_seconds = pd.Timedelta(f"{meta.get('tstep')}h").seconds
++        # ERA5 ssrd/strd are 1-hour accumulations (J m-2) whatever the sampling timestep (1h, 3h, 6h):
++        # convert to W m-2 with 3600 s (same convention as topo_scale.py)
++        tstep_seconds = 3600
+ 
+         subset_interp['cle'] = (subset_interp.strd / tstep_seconds) / (sbc * subset_interp.t2m ** 4) - \
+                              subset_interp['cse']
+@@ -392,7 +401,8 @@ class ClimateDownscaler:
+         
+         # currently drop azimuth and level as they are coords. Could be passed to variables instead.
+         # round(5) required to sufficiently represent specific humidty, q (eg typical value 0.00078)
+-        down_pt = down_pt.drop_vars(['level', 'precip_lapse_rate'])
++        # keep precip_lapse_rate (as in topo_scale.py): it allows recovering precipitation without the lapse rate
++        down_pt = down_pt.drop_vars(['level'], errors='ignore')
+         # adding metadata
+         down_pt.t.attrs = {'units': 'K', 'long_name': 'Temperature', 'standard_name': 'air_temperature'}
+         down_pt.q.attrs = {'units': 'kg kg**-1', 'long_name': 'Specific humidity', 'standard_name': 'specific_humidity'}
+@@ -436,16 +446,19 @@ class ClimateDownscaler:
+                               'git_commit': ver_dict.get('git_commit'),
+                              'url_TopoPyScale': 'https://github.com/ArcticSnow/TopoPyScale',
+                              'date_created': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+-            result = result.drop_vars(['point_name', 'reference_time'])
+-
+             if self.output_format.lower() == 'netcdf':
+-            
++                # same layout as topo_scale.py: point_name kept as coordinate and used in the file name, so that
++                # tu.read_downscaled() returns points indexed by point_name (integer ids sorted as strings would
++                # otherwise scramble the point order)
++                result = result.drop_vars(['reference_time'], errors='ignore')
++                result = result.assign_coords(point_name=str(subset_indices.get('point_name')))
+                 comp = dict(zlib=True, complevel=5)
+                 encoding = {var: comp for var in result.data_vars}
+-                result.to_netcdf(self.output_path / self.meta.get('file_pattern').replace("*", str(subset_indices.get('point_id'))),
++                result.to_netcdf(self.output_path / self.meta.get('file_pattern').replace("*", str(subset_indices.get('point_name'))),
+                           engine='h5netcdf', encoding=encoding, mode='a')
+ 
+             elif self.output_format.lower() == 'zarr':
++                result = result.drop_vars(['point_name', 'reference_time'], errors='ignore')
+                 vars = list(result.keys())
+                 comp = BloscCodec(cname='lz4', clevel=5, shuffle='bitshuffle', blocksize=0)
+                 encoder = dict(zip(vars, [{'compressors': comp}]*len(vars)))
+diff --git a/TopoPyScale/topo_utils.py b/TopoPyScale/topo_utils.py
+index 9761039..e178414 100644
+--- a/TopoPyScale/topo_utils.py
++++ b/TopoPyScale/topo_utils.py
+@@ -46,13 +46,16 @@ def ds_to_indexed_dataframe(ds):
+     n_levels = df.index.names.__len__()
+     return df.reset_index(level=list(range(0, n_levels)))
+ 
+-def multicore_pooling(fun, fun_param, n_cores):
++def multicore_pooling(fun, fun_param, n_cores, start_method='forkserver'):
+     '''
+     Function to perform multiprocessing on n_cores
+     Args:
+         fun (obj): function to distribute
+         fun_param zip(list): zip list of function arguments
+         n_core (int): number of cores
++        start_method (str): multiprocessing start method. Default 'forkserver' (default on Linux from Python 3.14):
++            workers start from a clean process. 'fork' copies the parent, which can deadlock when the parent
++            holds locks from threads (thread pools, open HDF5/netCDF files, Jupyter), as seen in downscale_climate.
+     '''
+     if n_cores is None:
+         n_cores = mproc.cpu_count() - 2
+@@ -65,7 +68,7 @@ def multicore_pooling(fun, fun_param, n_cores):
+     if n_cores == 0:
+         n_cores = 1
+ 
+-    pool = Pool(n_cores)
++    pool = mproc.get_context(start_method).Pool(n_cores)
+     pool.starmap(fun, fun_param)
+     pool.close()
+     pool.join()
+diff --git a/TopoPyScale/topoclass.py b/TopoPyScale/topoclass.py
+index aaa8c2a..f55ef7a 100644
+--- a/TopoPyScale/topoclass.py
++++ b/TopoPyScale/topoclass.py
+@@ -46,7 +46,8 @@ class Topoclass(object):
+ 
+         try:
+             with open(config_file, 'r') as f:
+-                self.config = DefaultMunch.fromYAML(f)
++                # explicit default: missing keys must be None (munch>=4 otherwise returns {}), the code relies on `is None`
++                self.config = DefaultMunch.fromYAML(f, None)
+ 
+             if self.config.project.directory in [None, {}]:
+                 self.config.project.directory = Path(os.getcwd())
+@@ -447,6 +448,11 @@ class Topoclass(object):
+         flist.append('cluster_labels')
+         if len(df_param.columns) > len(flist):
+             tmp = df_param.groupby('cluster_labels').mean()
++            if 'aspect' in tmp.columns and 'aspect' not in flist:
++                # aspect is an angle wrapping at 0/2pi (South): use the circular mean, not the arithmetic mean
++                sc = pd.DataFrame({'s': np.sin(df_param.aspect), 'c': np.cos(df_param.aspect),
++                                   'cluster_labels': df_param.cluster_labels}).groupby('cluster_labels').mean()
++                tmp['aspect'] = np.mod(np.arctan2(sc.s, sc.c), 2 * np.pi)
+             for var in df_param.drop(flist, axis=1).columns:
+                 self.toposub.df_centroids[var] = tmp[var]
+         self.toposub.df_centroids['cluster_labels'] = tmp.index.values.astype(int)
+@@ -850,11 +856,20 @@ class Topoclass(object):
+                        climate_dataset_name=self.config.project.climate,
+                        project_author=self.config.project.authors)
+ 
+-    def to_fsm(self, fname_format='FSM_pt_*.txt'):
++    def to_fsm(self, fname_format='FSM_pt_*.txt', snow_partition_method='continuous'):
+         """
+-        function to export toposcale output to FSM format
++        function to export toposcale output to FSM format.
++
++        The precipitation rate is computed with the timestep of the climate configuration
++        (e.g. climate.era5.timestep: 6h). Use the same value for 'dt' when running FSM
++        (sim_fsm.fsm_sim_parallel(..., fsm_dt=...)).
+         """
+-        te.to_fsm(self.downscaled_pts, self.config.outputs.path /  fname_format)
++        try:
++            tstep_seconds = pd.Timedelta(self.config.climate[self.config.project.climate].timestep.lower()).total_seconds()
++        except (AttributeError, ValueError, TypeError):
++            tstep_seconds = None  # inferred from the time coordinate of the downscaled data
++        te.to_fsm(self.downscaled_pts, self.config.outputs.path / fname_format,
++                  snow_partition_method=snow_partition_method, tstep_seconds=tstep_seconds)
+ 
+     def to_crocus(self, fname_format='CROCUS_pt_*.nc', scale_precip=1):
+         """

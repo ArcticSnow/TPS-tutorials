@@ -1,0 +1,9 @@
+data_links.yml
+data/
+FSM/
+TopoPyScale_src/
+*.zarr
+outputs/
+fsm_sims/
+__pycache__/
+.ipynb_checkpoints/

@@ -1,0 +1,33 @@
+name: tps
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - pip
+  - setuptools
+  - wheel
+  - pandas<3
+  - numpy
+  - xarray
+  - dask
+  - netcdf4
+  - h5netcdf
+  - rioxarray
+  - rasterio
+  - pyproj
+  - geopandas
+  - scikit-learn
+  - scipy
+  - pvlib-python
+  - matplotlib
+  - cython
+  - c-compiler
+  - openpyxl
+  - munch
+  - configobj
+  - gitpython
+  - bottleneck
+  - jupyterlab
+  - ipykernel
+  - nbconvert
+  # topocalc (ArcticSnow fork) and the patched TopoPyScale are pip-installed by setup_env.sh

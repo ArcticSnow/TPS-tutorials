@@ -1,0 +1,9 @@
+# Copy this file to data_links.yml and fill in the links you received for the workshop.
+# data_links.yml is git-ignored: do not commit the real links.
+
+era5_zip_url: https://<server>/<path>/ERA5_Pyr_2019_2020.zip     # ERA5 2019-2020, 6-hourly, daily dSURF_/dPLEV_ files
+izas_xlsx_url: https://<server>/<path>/Izas_Meteo_2019-2021.xlsx  # Izas AWS (IPE-CSIC), 10-min data
+
+# optional: folder for data and TopoPyScale outputs (default: ./data next to the notebook).
+# The environment variable TPS_PYR_DATA overrides it.
+data_root:

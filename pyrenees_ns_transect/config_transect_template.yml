@@ -1,0 +1,75 @@
+project:
+    name: Pyrenees_NS_transect
+    description: TopoPyScale demo - ERA5 (6-hourly) downscaled along a N-S transect across the Pyrenees (Huesca - Pau)
+    authors:
+        - Mazzolini M.
+    date: Nov 2026
+    directory: $project_dir
+    start: 2019-01-01
+    end: 2020-12-31
+    split:
+        IO: False
+        time: 1
+        space: None
+    extent:
+    climate: era5
+    parallelization:
+        downscaling_method: multicore
+        setting:
+            multicore:
+                CPU_cores: $cpu_cores
+            dask:
+                n_workers: $cpu_cores
+                threads_per_worker: 1
+                memory_target_fraction: 0.95
+                memory_limit: 4GB
+
+climate:
+    era5:
+        path: inputs/climate/
+        product: reanalysis
+        timestep: 6h            # lowercase! the provided ERA5 is 6-hourly (1-hour accumulations at 00/06/12/18 UTC)
+        plevels: [600, 650, 700, 750, 800, 850, 900, 950, 1000]
+        download_threads: 1
+        realtime: False
+        data_repository: cds
+        cds_output_format: netcdf
+        cds_download_format: unarchived
+        rm_daily: False
+        zarr_store: ERA5.zarr   # ERA5 converted to zarr: much faster downscaling than reading the NetCDF files
+    precip_lapse_rate: True
+
+dem:
+    file: $dem_file
+    epsg: 32630
+    horizon_increments: 10
+
+sampling:
+    method: toposub
+    toposub:
+        clustering_method: minibatchkmean
+        n_clusters: $n_clusters
+        random_seed: 2
+        clustering_features: {'x': 1, 'y': 1, 'elevation': 4, 'slope': 1, 'aspect_cos': 1, 'aspect_sin': 1, 'svf': 1}
+        clustering_mask: $mask_file      # 1 = transect, 0 = horizon buffer (relative to project directory)
+
+toposcale:
+    interpolation_method: idw
+    pt_sampling_method: nearest
+    LW_terrain_contribution: True
+
+outputs:
+    directory:
+    variables: all
+    file:
+        clean_outputs: False
+        clean_FSM: False
+        df_centroids: df_centroids.pck
+        ds_param: ds_param.nc
+        ds_solar: ds_solar.nc
+        da_horizon: da_horizon.nc
+        landform: landform.tif
+        downscaled_pt: down_pt_*.nc
+
+clean_up:
+    rm_tmp_dirs: True
