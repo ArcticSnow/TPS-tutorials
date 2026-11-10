@@ -5,7 +5,7 @@
 Pyrenees, from Huesca to Pau, using a 30 m Copernicus DEM. It shows:
 
 - the **N–S climate gradient**;
-- the **elevation gradient** that ERA5 (whose Pyrenees peak at ~1400 m) cannot resolve;
+- the **elevation gradient** that ERA5 cannot resolve (highest-elevation ERA5 cell is at ~1400 m);
 - **slope/aspect/shading effects on shortwave radiation**;
 - a **validation at the Izas AWS** (2113 m, IPE-CSIC);
 - a **snow simulation** with FSM, compared with the station snow depth.
