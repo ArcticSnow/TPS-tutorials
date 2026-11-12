@@ -173,11 +173,15 @@ def prepare_era5_1h(monthly_dir, out_dir, ref_dir, start="2019-11-01", end="2020
         t = pd.DatetimeIndex(ds.time.values)
         assert t.equals(hours), f"{name}: hourly time axis incomplete ({len(t)} of {len(hours)} steps)"
     common = pd.DatetimeIndex(ref_s.time.values).intersection(hours)
-    for v, tol in (("t2m", 0.01), ("ssrd", 50.0), ("tp", 1e-6), ("sp", 5.0)):
-        d = float(abs(surf[v].sel(time=common) - ref_s[v].sel(time=common)).max())
+    # same ERA5 fields; only GRIB packing differs between requests (daily vs monthly) -> physical tolerances
+    diffs = {}
+    for v, tol in (("t2m", 0.05), ("ssrd", 3600.0), ("strd", 3600.0), ("tp", 1e-5), ("sp", 10.0)):
+        diffs[v] = d = float(abs(surf[v].sel(time=common) - ref_s[v].sel(time=common)).max())
         assert d < tol, f"{v}: hourly and 6-hourly ERA5 differ by {d}"
-    d = float(abs(plev.t.sel(time=common) - ref_p.t.sel(time=common)).max())
-    assert d < 0.01, f"PLEV t: hourly and 6-hourly ERA5 differ by {d}"
+    for v, tol in (("t", 0.05), ("q", 1e-5), ("u", 0.05), ("z", 5.0)):
+        diffs[f"plev {v}"] = d = float(abs(plev[v].sel(time=common) - ref_p[v].sel(time=common)).max())
+        assert d < tol, f"PLEV {v}: hourly and 6-hourly ERA5 differ by {d}"
+    print("  max |hourly - 6-hourly| at common times:", {k: f"{v:.3g}" for k, v in diffs.items()})
     enc = lambda ds: {v: {"zlib": True, "complevel": 1, "dtype": "float32"} for v in ds.data_vars}
     for year in np.unique(hours.year):
         s_, p_ = surf.sel(time=str(year)), plev.sel(time=str(year))
@@ -270,7 +274,7 @@ def build_dem(tiles, out_tif, bounds, res=30.0, mask_tif=None, mask_bounds=None)
         m = m.transpose("y", "x")                       # (x & y) broadcasting yields (x, y)
         m = m.rio.write_crs(f"EPSG:{EPSG}").rio.write_transform(dem.rio.transform())
         m.rio.to_raster(mask_tif)
-    print(f"  {out_tif.name}: {dem.shape[0]} x {dem.shape[1]} px ({dem.size / 1e6:.1f} Mpx) at {res:.0f} m, "
+    print(f"  {out_tif.name}: {dem.shape[0]} x {dem.shape[1]} px ({dem.size / 1e6:.1f} million pixels) at {res:.0f} m, "
           f"elevation {float(dem.min()):.0f}-{float(dem.max()):.0f} m")
     return dem
 
@@ -491,12 +495,13 @@ def era5_display_map(da_ll, x, y):
 
 
 def era5_nearest(climate_dir, lat, lon):
-    """Raw ERA5 at the nearest grid cell (no interpolation). tp is scaled to mm per 6 h like TopoPyScale."""
+    """Raw ERA5 at the nearest grid cell (no interpolation). tp is scaled to mm per time step like TopoPyScale."""
     surf = xr.open_mfdataset(sorted(glob.glob(f"{climate_dir}/SURF_*.nc")), combine="by_coords")
     c = surf.sel(latitude=lat, longitude=lon, method="nearest").load()
+    tstep_h = (c.time[1] - c.time[0]).values / np.timedelta64(1, "h")   # ERA5 time step [h]
     df = pd.DataFrame({
         "T": c.t2m - 273.15, "RH": rh_from_dewpoint(c.t2m, c.d2m), "P": c.sp / 100,
-        "SW": c.ssrd / 3600, "LW": c.strd / 3600, "tp": c.tp * 1000 * 6,
+        "SW": c.ssrd / 3600, "LW": c.strd / 3600, "tp": c.tp * 1000 * tstep_h,
     }, index=pd.DatetimeIndex(c.time.values, name="time"))
     df.attrs = dict(lat=float(c.latitude), lon=float(c.longitude), oro=float(c.z.isel(time=0)) / G)
     return df
@@ -594,11 +599,32 @@ def metrics(obs, mod):
 # FSM
 # ----------------------------------------------------------------------------------------------
 
-def run_fsm(mp, fsm_exec, ds=None, tag="FSM", nave=4, nconfig=31, n_core=8):
+@contextlib.contextmanager
+def _quiet():
+    """
+    Silence the per-file messages of TopoPyScale and FSM: Python prints of this process and everything written to
+    file descriptor 1 (worker processes started from here, the FSM executable). Errors (stderr) still show.
+    """
+    import io
+    import sys
+    sys.stdout.flush()
+    devnull, saved = os.open(os.devnull, os.O_WRONLY), os.dup(1)
+    os.dup2(devnull, 1)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            yield
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
+        os.close(devnull)
+
+
+def run_fsm(mp, fsm_exec, ds=None, tag="FSM", nave=4, nconfig=31, n_core=8, quiet=True):
     """
     Export forcing with the (timestep-aware) TopoPyScale FSM exporter and run FSM for all points.
     ds: optional modified downscaled dataset (e.g. precipitation without lapse rate); default mp.downscaled_pts.
     Returns snow depth (m) and SWE (kg m-2) as DataArrays (point_name, time) with daily values.
+    quiet: hide the per-file messages (thousands of lines for thousands of clusters).
     """
     from TopoPyScale import sim_fsm, topo_export as te
 
@@ -606,7 +632,7 @@ def run_fsm(mp, fsm_exec, ds=None, tag="FSM", nave=4, nconfig=31, n_core=8):
     proj = Path(mp.config.project.directory)
     tstep = pd.Timedelta(mp.config.climate[mp.config.project.climate].timestep).total_seconds()
     fmt = f"{tag}_pt_*.txt"
-    with contextlib.chdir(proj):        # FSM (Fortran) needs short relative paths
+    with contextlib.chdir(proj), (_quiet() if quiet else contextlib.nullcontext()):   # FSM needs short relative paths
         for f in glob.glob(f"outputs/{fmt}") + glob.glob(f"fsm_sims/sim_{tag}_pt_*.txt"):
             os.remove(f)
         te.to_fsm(ds, Path("outputs") / fmt, tstep_seconds=tstep)
@@ -619,4 +645,311 @@ def run_fsm(mp, fsm_exec, ds=None, tag="FSM", nave=4, nconfig=31, n_core=8):
             df = sim_fsm.read_pt_fsm(f)
             snd[names[i]], swe[names[i]] = df["snd"], df["swe"]
     to_da = lambda d, n: xr.DataArray(pd.DataFrame(d).T.sort_index(), dims=("point_name", "time"), name=n)
+    print(f"FSM ({tag}): {len(snd)} points simulated, time step {tstep:.0f} s, daily outputs")
     return to_da(snd, "snd"), to_da(swe, "swe")
+
+# ----------------------------------------------------------------------------------------------
+# Shared by the two notebooks (1_downscaling, 2_analysis)
+# ----------------------------------------------------------------------------------------------
+
+def load_times(times_file):
+    import json
+    times_file = Path(times_file)
+    return json.loads(times_file.read_text()) if times_file.exists() else {}
+
+
+@contextlib.contextmanager
+def timed(label, times_file, cached=False):
+    """
+    Time a notebook step and keep its compute time in times_file (JSON, shared by both notebooks). When the step is
+    only loaded from existing outputs (cached), report the time it took when it was actually computed.
+    """
+    import json
+    import time
+    t0 = time.perf_counter()
+    yield
+    dt = time.perf_counter() - t0
+    times = load_times(times_file)
+    if cached and label in times:
+        print(f"[{label}] loaded from disk in {dt:.0f} s (computed in {times[label] / 60:.1f} min)")
+    elif cached:                     # outputs made elsewhere (e.g. copied from another project): no compute time
+        print(f"[{label}] loaded from disk in {dt:.0f} s")
+    else:
+        times[label] = dt
+        Path(times_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(times_file).write_text(json.dumps(times, indent=1))
+        print(f"[{label}] computed in {dt / 60:.1f} min")
+
+
+def disk_usage(p):
+    """Size of a file or folder in bytes."""
+    p = Path(p)
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.is_dir() else p.stat().st_size
+
+
+def km(v):
+    return np.asarray(v) / 1000.0
+
+
+def install_dem(files, project_dir):
+    """Copy the DEM (and mask) GeoTIFFs into <project>/inputs/dem, where TopoPyScale looks for them."""
+    import shutil
+    for f in files:
+        dst = Path(project_dir) / "inputs" / "dem" / Path(f).name
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(f, dst)
+
+
+CLUSTER_VARS = ["cluster_labels", "point_name", "point_ind", "mask"]   # written into ds_param.nc by the clustering
+
+
+def _dims_x_first(ds):
+    """
+    Same dataset with dimension order (x, y) and variables still (y, x), as produced by TopoPyScale's open_dem().
+    TopoPyScale's clustering writes the cluster labels back with np.reshape(..., order='F'), which is only right for
+    this order: a ds_param.nc opened from file has order (y, x) and would get scrambled label maps.
+    """
+    out = xr.Dataset(coords={"x": ds.x, "y": ds.y}, attrs=ds.attrs)
+    for v in ds.variables:
+        if v not in ("x", "y"):
+            out[v] = ds[v]
+    return out
+
+
+def dem_param(mp):
+    """
+    Step 1 without re-processing: if ds_param.nc already exists, open it instead of calling mp.compute_dem_param(),
+    which re-reads and rewrites the whole file even when nothing has to be computed (~8 min for the transect).
+    If the clustering still has to run (it rewrites ds_param.nc), the file is loaded in memory, without old labels
+    and in the dimension order the clustering expects.
+    """
+    out = Path(mp.config.outputs.path)
+    f = out / mp.config.outputs.file.ds_param
+    if not f.exists():
+        mp.compute_dem_param()
+    elif (out / mp.config.outputs.file.df_centroids).exists():
+        mp.toposub.ds_param = xr.open_dataset(f)
+    else:
+        mp.toposub.ds_param = _dims_x_first(xr.load_dataset(f).drop_vars(CLUSTER_VARS, errors="ignore"))
+    return mp.toposub.ds_param
+
+
+def seed_project(src_project, dst_project):
+    """
+    Re-use steps 1, 2 and 4 of a project with the same DEM and sampling but another ERA5 time step (they do not depend
+    on the time step): copy ds_param.nc (terrain + cluster labels) and df_centroids.pck, link da_horizon.nc. Files
+    that already exist in dst_project, or are missing in src_project, are left alone (they are then computed).
+    """
+    import shutil
+    src, dst = Path(src_project) / "outputs", Path(dst_project) / "outputs"
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in ("ds_param.nc", "df_centroids.pck"):
+        if (src / f).exists() and not (dst / f).exists():
+            shutil.copyfile(src / f, dst / f".{f}.part")
+            os.replace(dst / f".{f}.part", dst / f)
+    if (src / "da_horizon.nc").exists() and not (dst / "da_horizon.nc").exists():
+        (dst / "da_horizon.nc").symlink_to((src / "da_horizon.nc").resolve())
+
+
+def clearest_winter_noon(climate_dir, months=(12, 1)):
+    """The 12 UTC time step of December/January with the most ERA5 shortwave along the transect (a clear day)."""
+    cols = era5_columns(climate_dir)
+    t = cols.time.to_index()
+    sel = np.where((t.hour == 12) & t.month.isin(months))[0]
+    return t[sel][int(np.argmax(cols.ssrd.isel(time=sel).mean(["latitude", "longitude"]).values))]
+
+
+def seed_terrain(src_outputs, dst_outputs, ds_param="ds_param.nc", da_horizon="da_horizon.nc"):
+    """
+    Re-use the terrain analysis of a project on the same DEM in another project (slope, aspect, sky view and horizons
+    do not depend on the clustering):
+    - ds_param: copied without the cluster variables, with the original encoding. TopoPyScale writes the cluster labels
+      into this file, so two projects cannot share it;
+    - da_horizon: symbolic link (TopoPyScale only reads it).
+    """
+    src, dst = Path(src_outputs), Path(dst_outputs)
+    dst.mkdir(parents=True, exist_ok=True)
+    if not (dst / ds_param).exists():
+        import warnings
+        with xr.open_dataset(src / ds_param) as ds, warnings.catch_warnings():
+            warnings.simplefilter("ignore", xr.SerializationWarning)     # no _FillValue: there are no NaNs
+            ds = ds.drop_vars(CLUSTER_VARS, errors="ignore")
+            ds.to_netcdf(dst / f".{ds_param}.part")
+        os.replace(dst / f".{ds_param}.part", dst / ds_param)
+    if not (dst / da_horizon).exists():
+        (dst / da_horizon).symlink_to((src / da_horizon).resolve())
+
+
+def era5_cells_in(oro, bounds):
+    """ERA5 cell centres (lat, lon) of the field oro (dims latitude, longitude) whose centre lies within UTM bounds."""
+    out = []
+    for la in oro.latitude.values:
+        for lo in oro.longitude.values:
+            x, y = to_utm.transform(lo, la)
+            if bounds[0] < x < bounds[2] and bounds[1] < y < bounds[3]:
+                out.append((la, lo))
+    return out
+
+
+def draw_era5_cells(ax, cells, half=0.125, **kw):
+    """Outline ERA5 cells (lat, lon centres) on a UTM map in km; + marks the cell centres."""
+    from matplotlib.patches import Polygon
+    for la, lo in cells:
+        corners = [(lo - half, la - half), (lo + half, la - half), (lo + half, la + half), (lo - half, la + half)]
+        xy = np.array([to_utm.transform(a, b) for a, b in corners]) / 1000
+        ax.add_patch(Polygon(xy, fill=False, **kw))
+        x, y = to_utm.transform(lo, la)
+        ax.plot(x / 1000, y / 1000, "r+", ms=7)
+
+
+def map_clusters(ax, values, cmap, label, vmin=None, vmax=None, stride=6, params=None, dem=None, extent=None,
+                 res=30.0, colorbar=True):
+    """
+    Map per-cluster values (indexed by point_name) onto the pixels of each cluster (params = ds_param with the
+    cluster labels) over a hillshade of dem, with the Izas AWS as a gold star. stride > 1 subsamples for display.
+    """
+    g = to_grid(values, params, stride=stride)
+    e = extent or [km(g.x[0]), km(g.x[-1]), km(g.y[-1]), km(g.y[0])]
+    d = dem.sel(x=g.x, y=g.y, method="nearest")
+    ax.imshow(hillshade(d.values, res * stride), cmap="gray", extent=e)
+    im = ax.imshow(g, cmap=cmap, vmin=vmin, vmax=vmax, alpha=0.8, extent=e, interpolation="nearest")
+    if colorbar:
+        ax.figure.colorbar(im, ax=ax, shrink=0.6, label=label)   # ax.figure: also works inside subfigures
+    x0, y0 = to_utm.transform(IZAS["lon"], IZAS["lat"])
+    ax.plot(km(x0), km(y0), "*", color="gold", mec="k", ms=10)
+    ax.set_xticks([])
+    return im
+
+
+def izas_point_info(mp_i, station=IZAS):
+    """
+    The Izas points (station, elevation series, aspect rose) with their DEM parameters, indexed by point_name.
+    Group and target are recovered from the point names written by izas_point_table().
+    """
+    info = mp_i.toposub.df_centroids.set_index("point_name")
+    info["aspect_deg"] = compass_aspect(info.aspect)
+    info["slope_deg"] = np.rad2deg(info.slope)
+
+    def group_target(n):
+        if n == station["name"]:
+            return "station", np.nan
+        kind, tgt = n.split("_", 1)
+        return ("elevation_series", float(tgt)) if kind == "elev" else ("aspect_rose", float(DIRECTIONS[tgt]))
+
+    info["group"], info["target"] = zip(*[group_target(n) for n in info.index])
+    return info
+
+
+def read_downscaled(downscaled_dir, pattern="down_pt_*.nc"):
+    """
+    All downscaled points of a project, in memory (dims point_name, time). Reading the files one by one is much faster
+    than TopoPyScale's lazy open_mfdataset() + .load() when there are thousands of them (3000 files: ~1 min vs ~20).
+    """
+    files = sorted(glob.glob(f"{downscaled_dir}/{pattern}"))
+    return xr.concat([xr.load_dataset(f) for f in files], dim="point_name", coords="different", compat="equals")
+
+
+def load_results(mp):
+    """
+    Read the outputs of a finished project, like Topoclass.load_project() but with read_downscaled():
+    df_centroids, ds_param (with the cluster labels), ds_solar and the downscaled points (returned).
+    """
+    out, f = Path(mp.config.outputs.path), mp.config.outputs.file
+    mp.toposub.df_centroids = pd.read_pickle(out / f.df_centroids)
+    mp.toposub.ds_param = xr.open_dataset(out / f.ds_param)
+    mp.ds_solar = xr.open_dataset(out / f.ds_solar)
+    mp.downscaled_pts = read_downscaled(out / "downscaled")
+    return mp.downscaled_pts
+
+
+def open_era5_plev(climate_dir):
+    return xr.open_mfdataset(sorted(glob.glob(f"{climate_dir}/PLEV_*.nc")), combine="by_coords")
+
+
+def toposcale_weights(lat, lon, x, y, era_lat, era_lon):
+    """
+    The 3 x 3 ERA5 cells TopoPyScale uses for a point (centred on the nearest cell) and their horizontal weights
+    (inverse squared distance in the DEM projection, normalised), as in topo_scale_zarr.create_subset_indices()
+    and downscale_atmo(). Returns a (latitude, longitude) DataArray of weights.
+    """
+    ilat, ilon = np.abs(era_lat - lat).argmin(), np.abs(era_lon - lon).argmin()
+    la, lo = era_lat[ilat - 1:ilat + 2], era_lon[ilon - 1:ilon + 2]
+    LO, LA = np.meshgrid(lo, la)
+    X, Y = to_utm.transform(LO, LA)
+    w = 1.0 / ((x - X) ** 2 + (y - Y) ** 2)
+    return xr.DataArray(w / w.sum(), coords={"latitude": la, "longitude": lo}, dims=("latitude", "longitude"))
+
+
+def plot_workflow(times=None, n_clusters=300, timestep="6h", tag=""):
+    """
+    Flowchart of the TopoPyScale steps used in the notebooks: TopoPyScale call, what it computes, output file.
+    times: optional {label: seconds} (compute_times.json) to print the compute time of each step.
+    timestep: ERA5 time step ("6h" or "1h"); tag: suffix of the labels of the steps that depend on it (3 and 5).
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+
+    times = times or {}
+    def tmin(*keys):                                             # longest compute time among these labels
+        ts = [times[k] for k in keys if k in times]
+        return f"\n{max(ts) / 60:.1f} min" if ts else ""
+
+    fig = plt.figure(figsize=(13, 8.6))
+    ax = fig.add_axes([0.005, 0.0, 0.99, 0.94])
+    ax.set(xlim=(0, 1), ylim=(0, 1))
+    ax.axis("off")
+    W, XS, YT, YB, HT, HB = 0.225, (0.12, 0.375, 0.625, 0.88), 0.815, 0.345, 0.33, 0.43
+    boxes = {   # key: (x centre, y centre, height, colour, title, body)
+        "dem": (XS[0], YT, HT, "#e6e6e6", "DEM, 30 m",
+                "Copernicus GLO-30\nUTM 30N\ntransect + 10 km\nbuffer"),
+        "param": (XS[1], YT, HT, "#d9ead3", "1. Terrain",
+                  "compute_dem_param()\nslope, aspect,\nsky-view factor\nper pixel\n→ ds_param.nc"
+                  + tmin("1. Terrain: transect")),
+        "sub": (XS[2], YT, HT, "#d9ead3", "2. TopoSUB",
+                f"extract_topo_param()\n4.6 million pixels\n→ {n_clusters} clusters\n(or a list of points)\n→ df_centroids.pck"
+                + tmin(f"2. TopoSUB: {n_clusters} clusters")),
+        "solar": (XS[3], YT, HT, "#fff2cc", "3. Solar geometry",
+                  "compute_solar_geometry()\nsun position per\ncluster and time step\n→ ds_solar.nc"
+                  + tmin(f"3. Solar geometry: {n_clusters} clusters{tag}")),
+        "era5": (XS[0], YB, HB, "#cfe2f3", "ERA5, " + {"6h": "6-hourly", "1h": "hourly"}.get(timestep, timestep),
+                 "surface and\npressure levels\n→ ERA5.zarr"),
+        "hor": (XS[1], YB, HB, "#d9ead3", "4. Horizons",
+                "compute_horizon()\n36 azimuths per pixel\n→ da_horizon.nc" + tmin(*[k for k in times if k.startswith("4. Horizons")])),
+        "scale": (XS[2], YB, HB, "#fce5cd", "5. TopoScale",
+                  "downscale_climate()\nper cluster, from the\n3 × 3 ERA5 cells:\nT, q, wind interpolated\n"
+                  "to the cluster elevation;\nSW: slope, shadows,\nsky view\n→ down_pt_*.nc"
+                  + tmin(f"5. TopoScale: {n_clusters} clusters{tag}")),
+        "out": (XS[3], YB, HB, "#ead1dc", "Results",
+                "one time series\nper cluster\n→ maps: painted back\non the cluster pixels\n→ FSM snow model\n"
+                "(notebook 2)"),
+    }
+    for x, y, h, c, title, body in boxes.values():
+        ax.add_patch(FancyBboxPatch((x - W / 2, y - h / 2), W, h, boxstyle="round,pad=0.005,rounding_size=0.015",
+                                    fc=c, ec="0.3", lw=1.2))
+        ax.text(x, y + h / 2 - 0.02, title, ha="center", va="top", fontsize=16, weight="bold")
+        ax.text(x, y + h / 2 - 0.075, body, ha="center", va="top", fontsize=13, linespacing=1.25)
+
+    def arrow(p0, p1, ls="-", **kw):
+        ax.annotate("", xy=p1, xytext=p0, arrowprops=dict(arrowstyle="-|>", color="0.25", lw=1.6, ls=ls,
+                                                          mutation_scale=18, **kw))
+
+    def label(x, y, text, **kw):
+        ax.text(x, y, text, fontsize=12, style="italic", color="0.3", **kw)
+
+    e = W / 2
+    for a, b in zip(XS[:-1], XS[1:]):                            # DEM -> 1 -> 2 -> 3
+        arrow((a + e, YT), (b - e, YT))
+    arrow((XS[1] + e, YB), (XS[2] - e, YB))                      # horizons -> TopoScale
+    arrow((XS[2] + e, YB), (XS[3] - e, YB))                      # TopoScale -> results
+    arrow((XS[0] + 0.03, YT - HT / 2), (XS[1] - e, YB + 0.1))   # DEM -> horizons
+    arrow((XS[2] - 0.03, YT - HT / 2), (XS[1] + e, YB + 0.12), ls="--")   # clusters -> horizons (sampling)
+    label(XS[1] + 0.04, 0.6, "sampled at the\ncluster centroids", ha="left", va="center")
+    arrow((XS[2] + 0.03, YT - HT / 2), (XS[2] + 0.03, YB + HB / 2))   # clusters -> TopoScale
+    arrow((XS[3] - 0.03, YT - HT / 2), (XS[2] + e, YB + 0.14))        # solar -> TopoScale
+    y0 = 0.05                                                      # ERA5 -> TopoScale, below the boxes
+    ax.plot([XS[0], XS[0], XS[2] - 0.05], [YB - HB / 2, y0, y0], color="0.25", lw=1.6)
+    arrow((XS[2] - 0.05, y0), (XS[2] - 0.05, YB - HB / 2))
+    label(XS[1], y0 + 0.022, "ERA5 cells around each cluster", ha="center", va="center")
+    fig.suptitle("TopoPyScale workflow (Topoclass methods; outputs in <project>/outputs)", fontsize=17)
+    return fig

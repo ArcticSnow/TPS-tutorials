@@ -1,12 +1,12 @@
 project:
     name: Izas_points
-    description: TopoPyScale demo - ERA5 (6-hourly) downscaled to the Izas AWS and two aspect "twins"
+    description: TopoPyScale demo - ERA5 ($timestep) downscaled to points around the Izas AWS
     authors:
         - Mazzolini M.
     date: Nov 2026
     directory: $project_dir
-    start: 2019-01-01
-    end: 2020-12-31
+    start: $start
+    end: $end
     split:
         IO: False
         time: 1
@@ -28,7 +28,7 @@ climate:
     era5:
         path: inputs/climate/
         product: reanalysis
-        timestep: 6h
+        timestep: $timestep         # lowercase: 6h or 1h (radiation/precipitation are 1-hour accumulations)
         plevels: [600, 650, 700, 750, 800, 850, 900, 950, 1000]
         download_threads: 1
         realtime: False
