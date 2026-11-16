@@ -8,15 +8,16 @@ Run them in this order:
    the workflow figure: Inputs, 1. Terrain, 2. TopoSUB (or a list of points), 3. Solar geometry, 4. Horizons,
    5. TopoScale, Results. It shows:
    - the terrain parameters and the clusters, with 300 and 3000 clusters;
-   - the points around the Izas AWS and the station horizon vs the sun path;
+   - the points around the two weather stations (Izas, Gourette) and the Izas horizon vs the sun path;
    - a downscaled field and the partial results of the downscaling around Izas;
    - the summary and the compute times.
 2. **`2_analysis.ipynb`** loads the outputs of notebook 1 and shows:
    - the **N–S climate gradient**;
    - the **elevation gradient** that ERA5 cannot resolve (highest-elevation ERA5 cell is at ~1400 m);
    - **slope/aspect/shading effects on shortwave radiation**;
-   - a **validation at the Izas AWS** (2113 m, IPE-CSIC);
-   - a **snow simulation** with FSM, compared with the station snow depth.
+   - a **validation at two stations**: the Izas AWS (2113 m, IPE-CSIC, south side) and Gourette (1590 m,
+     Météo-France, north side; daily 06 UTC winter readings of T, RH, wind and snow depth);
+   - a **snow simulation** with FSM, compared with the snow depth at both stations.
 
 Notebook 2 does not run the downscaling; it stops with an error if the outputs of notebook 1 are missing.
 
@@ -34,6 +35,7 @@ jupyter lab                      # open 1_downscaling.ipynb, then 2_analysis.ipy
 - The data are downloaded on first use into `./data`, or into `data_root` / `$TPS_PYR_DATA`. They are:
   - the ERA5 zip;
   - the Izas AWS file;
+  - the Gourette (Météo-France) station file;
   - two Copernicus GLO-30 tiles.
 - The data links are private and are not part of this repository.
 
@@ -59,7 +61,7 @@ once, and it does not depend on the number of clusters:
 | 4. Horizons (36 azimuths, every pixel) | ~26 min |
 | 300 clusters (8 cores): 2. TopoSUB / 5. TopoScale, ERA5 from **zarr** / FSM | ~7 / **~1** / < 1 min |
 | 3000 clusters (20 cores, terrain re-used): 2. TopoSUB / 3. Solar geometry / 5. TopoScale / FSM | ~3 / ~1.5 / **~4.5** / ~3.5 min |
-| Izas points project (24 km window), steps 1–5 | ~1 min |
+| each station points project (Izas, Gourette; 24 km window), steps 1–5 | ~1 min |
 
 A first run in full mode, with the terrain files already there, takes ~25 min. With all outputs on disk, each notebook
 re-runs in a few minutes.

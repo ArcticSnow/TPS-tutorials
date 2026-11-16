@@ -7,6 +7,7 @@ dependencies:
   - setuptools
   - wheel
   - pandas<3
+  - pyarrow                # reads the Météo-France station pickles (text columns are pyarrow arrays)
   - numpy
   - xarray
   - dask

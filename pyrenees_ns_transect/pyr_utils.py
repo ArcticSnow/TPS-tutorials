@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import glob
 import os
+import pickle
 import string
 import urllib.request
 import zipfile
@@ -34,9 +35,16 @@ ERA5_COLS = (-0.561, -0.311)      # the two ERA5 grid columns inside the transec
 ERA5_BBOX = (41.4, 44.1, -1.6, 0.8)   # S, N, W, E crop of the ERA5 files (keeps 3x3 stencil interior)
 TRANSECT = dict(lat_s=42.10, lat_n=43.35, lon_c=float(np.mean(ERA5_COLS)), width_km=30.0)
 
+# Stations with a points project (station + elevation series at `levels` + aspect rose). name = point name in
+# TopoPyScale, color = colour of the station in the figures.
 # Izas AWS (IPE-CSIC) position and elevation from the station metadata. (The rounded literature value
 # 42°44'N 0°25'W is ~1 km off and falls on a 25° SE-facing slope at 1900 m in the DEM.)
-IZAS = dict(name="Izas_AWS", lat=42.74268, lon=-0.41912, elev=2113.0)
+IZAS = dict(name="Izas_AWS", label="Izas AWS", lat=42.74268, lon=-0.41912, elev=2113.0, color="gold",
+            levels=range(1200, 2801, 200), title="Izas AWS: 2113 m, south side (IPE-CSIC)")
+# Gourette, Météo-France station 64320404 (ski resort, French side): one reading per day at 06 UTC in winter of
+# temperature, humidity, wind and snow depth; no precipitation, pressure or radiation. Metadata: df_poste_description.
+GOURETTE = dict(name="Gourette", label="Gourette", lat=42.950333, lon=-0.331667, elev=1590.0, color="deeppink",
+                levels=range(800, 2601, 200), title="Gourette: 1590 m, north side (Météo-France)", num_poste=64320404)
 
 PLACES = {  # for map annotations (lat, lon)
     "Huesca": (42.136, -0.408), "Jaca": (42.570, -0.549), "Sallent": (42.771, -0.333),
@@ -77,7 +85,7 @@ def load_links(path=LINKS_FILE):
 
 
 def download_inputs(raw_dir, links):
-    """Download (once) the ERA5 zip, the Izas xlsx and the Copernicus GLO-30 DEM tiles."""
+    """Download (once) the ERA5 zip, the Izas xlsx, the Gourette (Météo-France) file and the Copernicus DEM tiles."""
     raw = Path(raw_dir)
     z = _download(links["era5_zip_url"], raw / "ERA5_Pyr_2019_2020.zip")
     daily = raw / "era5_daily"
@@ -86,9 +94,14 @@ def download_inputs(raw_dir, links):
         with zipfile.ZipFile(z) as zf:
             zf.extractall(daily)
     _download(links["izas_xlsx_url"], raw / "Izas_Meteo_2019-2021.xlsx")
+    mf = raw / "meteofrance" / f"df_obs_{GOURETTE['num_poste']}.pckl"
+    if links.get("gourette_pckl_url"):
+        _download(links["gourette_pckl_url"], mf)
+    elif not mf.exists():
+        print(f"  WARNING: {mf} not found and no gourette_pckl_url in {LINKS_FILE.name}: notebook 2 needs it")
     tiles = [_download(COP30_URL.format(t=t), raw / "dem_tiles" / f"Copernicus_DSM_COG_10_{t}_DEM.tif")
              for t in DEM_TILES]
-    return dict(era5_daily=daily, izas_xlsx=raw / "Izas_Meteo_2019-2021.xlsx", dem_tiles=tiles)
+    return dict(era5_daily=daily, izas_xlsx=raw / "Izas_Meteo_2019-2021.xlsx", gourette_pckl=mf, dem_tiles=tiles)
 
 # ----------------------------------------------------------------------------------------------
 # ERA5 -> TopoPyScale input format
@@ -452,11 +465,11 @@ def pick_elevation_series(ds_param, x0, y0, levels=range(1200, 2801, 200), radiu
     return pd.DataFrame(out)
 
 
-def izas_point_table(ds_param, station=IZAS):
-    """Izas AWS + elevation series + aspect rose, as the points CSV for TopoPyScale (x, y in EPSG:32630)."""
+def station_point_table(ds_param, station):
+    """Station + elevation series + aspect rose, as the points CSV for TopoPyScale (x, y in EPSG:32630)."""
     x0, y0 = to_utm.transform(station["lon"], station["lat"])
     rows = [dict(name=station["name"], x=x0, y=y0, group="station", target=np.nan)]
-    return pd.concat([pd.DataFrame(rows), pick_elevation_series(ds_param, x0, y0),
+    return pd.concat([pd.DataFrame(rows), pick_elevation_series(ds_param, x0, y0, levels=station["levels"]),
                       pick_aspect_rose(ds_param, x0, y0)], ignore_index=True)
 
 # ----------------------------------------------------------------------------------------------
@@ -561,6 +574,43 @@ def izas_at(df10, times):
     out = pd.concat([inst, sw, pr.rename("precip")], axis=1).reindex(pd.DatetimeIndex(times))
     out.index.name = "time"
     return out
+
+# ----------------------------------------------------------------------------------------------
+# Météo-France stations (Gourette)
+# ----------------------------------------------------------------------------------------------
+_MF_COLS = {"t": "T", "u": "RH", "ff": "WS", "neigetot": "HS", "rr1": "precip"}
+
+
+class _DataUnpickler(pickle.Unpickler):
+    """
+    Rebuilds pandas/numpy data objects only (a data pickle received from elsewhere cannot run any other code).
+    Text columns of recent pandas are pyarrow arrays: pyarrow must be installed.
+    """
+    _NAMES = {("builtins", "slice"), ("numpy", "dtype"), ("numpy", "ndarray"), ("pyarrow.lib", "_restore_array"),
+              ("pyarrow.lib", "py_buffer"), ("pyarrow.lib", "type_for_alias")} | {
+             ("pandas", n) for n in ("DataFrame", "Series", "Index", "RangeIndex", "DatetimeIndex", "MultiIndex",
+                                     "StringDtype", "CategoricalDtype", "Categorical", "Timestamp", "Timedelta")}
+    _MODULES = ("pandas._libs.", "pandas.arrays", "pandas.core.arrays.", "pandas.core.indexes.",
+                "pandas.core.internals.", "numpy._core.multiarray", "numpy._core.numeric", "numpy.core.multiarray",
+                "numpy.core.numeric")
+
+    def find_class(self, module, name):
+        if (module, name) in self._NAMES or module.startswith(self._MODULES):
+            return super().find_class(module, name)
+        raise pickle.UnpicklingError(f"{module}.{name} is not allowed in a data pickle")
+
+
+def load_mf(pckl):
+    """
+    Météo-France station file (df_obs_<num_poste>.pckl, one row per observation, UTC) in station units:
+    T [°C], RH [%], WS [m/s], HS snow depth [m], precip [mm/h]. Missing variables are all-NaN columns that are dropped.
+    """
+    with open(pckl, "rb") as f:
+        raw = _DataUnpickler(f).load()
+    df = raw[list(_MF_COLS)].rename(columns=_MF_COLS).astype(float)
+    df["HS"] /= 100                                            # cm -> m
+    df.index = pd.DatetimeIndex(raw["date"], name="time").as_unit("ns")    # same resolution as the model times
+    return df.dropna(axis=1, how="all").sort_index()
 
 # ----------------------------------------------------------------------------------------------
 # Downscaled point -> DataFrame, metrics
@@ -807,7 +857,8 @@ def map_clusters(ax, values, cmap, label, vmin=None, vmax=None, stride=6, params
                  res=30.0, colorbar=True):
     """
     Map per-cluster values (indexed by point_name) onto the pixels of each cluster (params = ds_param with the
-    cluster labels) over a hillshade of dem, with the Izas AWS as a gold star. stride > 1 subsamples for display.
+    cluster labels) over a hillshade of dem, with the stations inside the map as stars (Izas gold, Gourette pink).
+    stride > 1 subsamples for display.
     """
     g = to_grid(values, params, stride=stride)
     e = extent or [km(g.x[0]), km(g.x[-1]), km(g.y[-1]), km(g.y[0])]
@@ -816,18 +867,20 @@ def map_clusters(ax, values, cmap, label, vmin=None, vmax=None, stride=6, params
     im = ax.imshow(g, cmap=cmap, vmin=vmin, vmax=vmax, alpha=0.8, extent=e, interpolation="nearest")
     if colorbar:
         ax.figure.colorbar(im, ax=ax, shrink=0.6, label=label)   # ax.figure: also works inside subfigures
-    x0, y0 = to_utm.transform(IZAS["lon"], IZAS["lat"])
-    ax.plot(km(x0), km(y0), "*", color="gold", mec="k", ms=10)
+    for st in (IZAS, GOURETTE):
+        x0, y0 = to_utm.transform(st["lon"], st["lat"])
+        if e[0] <= km(x0) <= e[1] and e[2] <= km(y0) <= e[3]:     # only stations inside the map
+            ax.plot(km(x0), km(y0), "*", color=st["color"], mec="k", ms=10)
     ax.set_xticks([])
     return im
 
 
-def izas_point_info(mp_i, station=IZAS):
+def station_point_info(mp_s, station):
     """
-    The Izas points (station, elevation series, aspect rose) with their DEM parameters, indexed by point_name.
-    Group and target are recovered from the point names written by izas_point_table().
+    The points of a station project (station, elevation series, aspect rose) with their DEM parameters, indexed by
+    point_name. Group and target are recovered from the point names written by station_point_table().
     """
-    info = mp_i.toposub.df_centroids.set_index("point_name")
+    info = mp_s.toposub.df_centroids.set_index("point_name")
     info["aspect_deg"] = compass_aspect(info.aspect)
     info["slope_deg"] = np.rad2deg(info.slope)
 

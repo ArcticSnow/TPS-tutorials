@@ -1,6 +1,6 @@
 project:
-    name: Izas_points
-    description: TopoPyScale demo - ERA5 ($timestep) downscaled to points around the Izas AWS
+    name: ${station}_points
+    description: TopoPyScale demo - ERA5 ($timestep) downscaled to points around the $station station
     authors:
         - Mazzolini M.
     date: Nov 2026
@@ -47,7 +47,7 @@ dem:
 sampling:
     method: points
     points:
-        csv_file: izas_points.csv     # columns name, x, y (EPSG:32630), in inputs/dem/
+        csv_file: $csv_file     # columns name, x, y (EPSG:32630), in inputs/dem/
         name_column: name
 
 toposcale:
