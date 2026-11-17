@@ -10,7 +10,9 @@ import contextlib
 import glob
 import os
 import pickle
+import shutil
 import string
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -58,20 +60,63 @@ G = 9.80665
 # Downloads
 # ----------------------------------------------------------------------------------------------
 
-def _download(url: str, dst: Path):
+def _direct_url(url: str) -> str:
+    """A Dropbox share link (...&dl=0) opens a preview page; dl=1 downloads the file itself."""
+    u = urllib.parse.urlsplit(url)
+    if u.netloc.endswith("dropbox.com"):
+        q = [(k, v) for k, v in urllib.parse.parse_qsl(u.query) if k != "dl"] + [("dl", "1")]
+        url = urllib.parse.urlunsplit(u._replace(query=urllib.parse.urlencode(q)))
+    return url
+
+
+# Input files under raw/: in the workshop data folder (data_folder_url) or behind one link each
+ERA5_ZIP, IZAS_XLSX = "ERA5_Pyr_2019_2020.zip", "Izas_Meteo_2019-2021.xlsx"
+MF_PCKL = f"meteofrance/df_obs_{GOURETTE['num_poste']}.pckl"
+ERA5_1H_ZIP = "ERA5_Pyr_1h_2019-11_2020-04.zip"
+FOLDER_FILES = (ERA5_ZIP, IZAS_XLSX, MF_PCKL, ERA5_1H_ZIP)
+
+
+def _download(url: str | None, dst: Path):
     dst = Path(dst)
     if dst.exists() and dst.stat().st_size > 0:
         print(f"  found {dst.name}")
         return dst
+    if not url:
+        raise FileNotFoundError(f"{dst} not found, and no link for it in {LINKS_FILE.name} (data_folder_url)")
     dst.parent.mkdir(parents=True, exist_ok=True)
     print(f"  downloading {dst.name} ...")
-    req = urllib.request.Request(url, headers={"X-Requested-With": "XMLHttpRequest"})
+    req = urllib.request.Request(_direct_url(url), headers={"X-Requested-With": "XMLHttpRequest"})
     tmp = dst.with_suffix(dst.suffix + ".part")
     with urllib.request.urlopen(req, timeout=600) as r, open(tmp, "wb") as f:
         while chunk := r.read(1 << 20):
             f.write(chunk)
     tmp.rename(dst)
     return dst
+
+
+def _unpack_data_folder(url, raw: Path, needed):
+    """
+    The workshop data folder (data_folder_url, a Dropbox folder link) downloads as one zip of all its files: if one of
+    the `needed` files is missing, download it, put each of FOLDER_FILES in its place under raw/ and delete the zip.
+    """
+    if not url or all((raw / f).exists() for f in needed):
+        return
+    z = _download(url, raw / "data_folder.zip")
+    print("  unpacking the data folder ...")
+    with zipfile.ZipFile(z) as zf:
+        members = {Path(i.filename).name: i for i in zf.infolist() if not i.is_dir()}
+        for f in FOLDER_FILES:
+            dst = raw / f
+            if Path(f).name in members and not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                tmp = dst.with_suffix(dst.suffix + ".part")
+                with zf.open(members[Path(f).name]) as src, open(tmp, "wb") as out:
+                    shutil.copyfileobj(src, out, 1 << 20)
+                tmp.rename(dst)
+    z.unlink()                                                  # the files are in place: free the space of the zip
+    missing = [f for f in needed if not (raw / f).exists()]
+    if missing:
+        raise FileNotFoundError(f"not in the data folder of {LINKS_FILE.name}: {missing}")
 
 
 def load_links(path=LINKS_FILE):
@@ -85,23 +130,50 @@ def load_links(path=LINKS_FILE):
 
 
 def download_inputs(raw_dir, links):
-    """Download (once) the ERA5 zip, the Izas xlsx, the Gourette (Météo-France) file and the Copernicus DEM tiles."""
+    """
+    Download (once) the ERA5 zip, the Izas xlsx, the Gourette (Météo-France) file and the Copernicus DEM tiles. The
+    first three come from the workshop data folder (data_folder_url) or from one link each (era5_zip_url, ...).
+    """
     raw = Path(raw_dir)
-    z = _download(links["era5_zip_url"], raw / "ERA5_Pyr_2019_2020.zip")
+    _unpack_data_folder(links.get("data_folder_url"), raw, needed=(ERA5_ZIP, IZAS_XLSX, MF_PCKL))
+    z = _download(links.get("era5_zip_url"), raw / ERA5_ZIP)
     daily = raw / "era5_daily"
     if len(glob.glob(str(daily / "d*_*.nc"))) < 1462:
         print("  unzipping ERA5 ...")
         with zipfile.ZipFile(z) as zf:
             zf.extractall(daily)
-    _download(links["izas_xlsx_url"], raw / "Izas_Meteo_2019-2021.xlsx")
-    mf = raw / "meteofrance" / f"df_obs_{GOURETTE['num_poste']}.pckl"
+    _download(links.get("izas_xlsx_url"), raw / IZAS_XLSX)
+    mf = raw / MF_PCKL
     if links.get("gourette_pckl_url"):
         _download(links["gourette_pckl_url"], mf)
     elif not mf.exists():
-        print(f"  WARNING: {mf} not found and no gourette_pckl_url in {LINKS_FILE.name}: notebook 2 needs it")
+        print(f"  WARNING: {mf} not found and no link for it in {LINKS_FILE.name}: notebook 2 needs it")
     tiles = [_download(COP30_URL.format(t=t), raw / "dem_tiles" / f"Copernicus_DSM_COG_10_{t}_DEM.tif")
              for t in DEM_TILES]
-    return dict(era5_daily=daily, izas_xlsx=raw / "Izas_Meteo_2019-2021.xlsx", gourette_pckl=mf, dem_tiles=tiles)
+    return dict(era5_daily=daily, izas_xlsx=raw / IZAS_XLSX, gourette_pckl=mf, dem_tiles=tiles)
+
+
+def download_era5_1h(raw_dir, links, monthly_dir):
+    """
+    Hourly ERA5, Nov 2019 - Apr 2020 (the files of download_era5_1h.py), unzipped into monthly_dir from the zip in the
+    workshop data folder (data_folder_url) or behind era5_1h_zip_url. Without a link, the files must be in monthly_dir.
+    """
+    raw, monthly = Path(raw_dir), Path(monthly_dir)
+    have = {p.name for p in monthly.glob("m*_*.nc")}
+    z = raw / ERA5_1H_ZIP
+    if not have:
+        _unpack_data_folder(links.get("data_folder_url"), raw, needed=(ERA5_1H_ZIP,))
+    if links.get("era5_1h_zip_url") or z.exists():
+        _download(links.get("era5_1h_zip_url"), z)
+        with zipfile.ZipFile(z) as zf:
+            missing = [n for n in zf.namelist() if n not in have]
+            if missing:
+                print(f"  unzipping hourly ERA5 ({len(missing)} files) ...")
+                zf.extractall(monthly, members=missing)
+    elif not have:
+        raise FileNotFoundError(f"no hourly ERA5 in {monthly}: add data_folder_url (or era5_1h_zip_url) to "
+                                f"{LINKS_FILE.name}, or download it from the CDS with download_era5_1h.py")
+    return monthly
 
 # ----------------------------------------------------------------------------------------------
 # ERA5 -> TopoPyScale input format

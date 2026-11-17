@@ -25,7 +25,7 @@ Notebook 2 does not run the downscaling; it stops with an error if the outputs o
 
 ```bash
 bash setup_env.sh                # conda env 'tps' + topocalc + patched TopoPyScale + FSM + Jupyter kernel
-cp data_links.example.yml data_links.yml   # then paste the data links you received for the workshop
+cp -n data_links.example.yml data_links.yml   # unless it exists; then paste the data folder link you received
 conda activate tps
 jupyter lab                      # open 1_downscaling.ipynb, then 2_analysis.ipynb (kernel "Python (tps, TopoPyScale)")
 ```
@@ -75,7 +75,8 @@ Outputs:
 
 ## Hourly ERA5
 
-With `ERA5_TIMESTEP = "1h"`, notebook 1 expects hourly ERA5 in `<data>/era5_1h/monthly`, downloaded with
+With `ERA5_TIMESTEP = "1h"`, notebook 1 expects hourly ERA5 in `<data>/era5_1h/monthly`. It takes them from the
+workshop data folder (`data_folder_url` in `data_links.yml`) if there is one; otherwise download them yourself with
 `download_era5_1h.py` (as few CDS requests as the cost limits allow: surface one request per month, pressure levels in
 7-day chunks). It prepares them in `<data>/era5_1h/topopyscale` and checks them against the 6-hourly files at
 00/06/12/18 UTC.
