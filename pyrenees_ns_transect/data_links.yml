@@ -1,0 +1,9 @@
+# TopoPyScale Pyrenees workshop: data links.
+# In the repository for the workshop of 17 November 2026 only; it will be removed afterwards.
+# Notebook 1 downloads the data folder (~550 MB) on first use.
+
+data_folder_url: https://www.dropbox.com/scl/fo/akjmjquvl7421q4y429ix/ADFvWc72A3d0aWO_S2OHRLY?rlkey=7xuxdji0gfy3vpvb9244zo8bc&st=zwd927g5&dl=0
+
+# optional: folder for data and TopoPyScale outputs (default: ./data next to the notebook).
+# The environment variable TPS_PYR_DATA overrides it.
+data_root:
